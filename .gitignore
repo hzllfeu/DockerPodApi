@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+*.so
+
+# Bazel
+bazel-*
+.bazelrc.user
+
+# OCI / build artifacts
+*.tar
+*.tar.gz
+*.oci
+oci/
+bazel-bin/
+bazel-out/
+bazel-testlogs/
+bazel-DockerPodApi/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+secrets.yaml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Cache
+/cache/
+hf_cache/

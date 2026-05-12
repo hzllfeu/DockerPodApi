@@ -1,0 +1,38 @@
+# Echo pod runtime deps. Versions pinned to known-good values.
+
+# FastAPI + HTTP
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+httpx==0.27.2
+pydantic==2.9.2
+
+# Audio
+soundfile==0.13.0
+numpy<2
+
+# HF stack
+transformers==4.55.0
+huggingface_hub==0.34.4
+accelerate==1.1.1
+tokenizers==0.21.4
+
+# Speech / DiariZen runtime deps
+pyannote.core<6
+pyannote.metrics<4
+pyannote.database<6
+pyannote.pipeline<3.1
+speechbrain==1.0.3
+librosa==0.10.2.post1
+einops==0.8.1
+asteroid-filterbanks==0.4.0
+torchmetrics==1.8.1
+pytorch-lightning==2.5.3
+lightning==2.5.3
+omegaconf==2.3.0
+hyperpyyaml==1.2.2
+sentencepiece==0.2.1
+toml==0.10.2
+tabulate==0.9.0
+
+# Whisper-style ASR / target speaker
+silero-vad==6.0.0
