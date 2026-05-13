@@ -98,6 +98,26 @@ class InferAsyncRequest(BaseModel):
     request_id: str | None = None
 
 
+# ---------- eager loader (used by Modal memory snapshot) ----------
+def _eager_load_models() -> None:
+    """Module-level eager loader for Modal @modal.enter(snap=True).
+
+    Builds the inference Pipeline and forces model weights onto CUDA, so the
+    state is captured in the GPU memory snapshot. Idempotent.
+
+    Standalone docker (uvicorn) keeps using the async lifespan below — this
+    function is invoked ONLY by modal_app.py before the snapshot is taken.
+    """
+    global PIPELINE
+    if PIPELINE is not None and PIPELINE.is_ready():
+        return
+    validate_boot_config()
+    log.info("eager load: building pipeline for Modal snapshot...")
+    PIPELINE = Pipeline()
+    PIPELINE.load()
+    log.info("eager load: pipeline ready=%s", PIPELINE.is_ready())
+
+
 # ---------- lifespan ----------
 
 @asynccontextmanager
