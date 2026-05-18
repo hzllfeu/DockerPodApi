@@ -24,6 +24,94 @@ log = logging.getLogger(__name__)
 TS_PAT = re.compile(r"<\|(\d+\.\d+)\|>")
 
 
+class _BatchSizeTuner:
+    """Adaptive batch_size finder for DiCoW inference.
+
+    Behavior:
+      - Starts at `initial` (env-overridable via ECHO_BATCH_SIZE_INIT, else
+        derived from total VRAM at first call).
+      - On OOM, halves `current` (down to 1) and retries on the SAME call.
+      - On 3 consecutive successes at current value, tries to bump up one step
+        (next power of 2, capped at `max_cap`).
+    """
+
+    def __init__(self, max_cap: int = 32):
+        self._fixed = os.environ.get("ECHO_BATCH_SIZE_FIXED")
+        if self._fixed:
+            self._fixed = max(1, int(self._fixed))
+            self.current = self._fixed
+        else:
+            init = os.environ.get("ECHO_BATCH_SIZE_INIT")
+            if init:
+                self.current = max(1, int(init))
+            else:
+                self.current = self._initial_from_vram()
+        self.max_cap = max_cap
+        self._consecutive_ok = 0
+
+    @staticmethod
+    def _initial_from_vram() -> int:
+        try:
+            if not torch.cuda.is_available():
+                return 1
+            _free, total = torch.cuda.mem_get_info()
+            total_gb = total / 1e9
+            if total_gb >= 70:
+                return 16
+            if total_gb >= 35:
+                return 8
+            if total_gb >= 22:
+                return 4
+            if total_gb >= 14:
+                return 2
+            return 1
+        except Exception:
+            return 1
+
+    def run(self, fn) -> tuple:
+        import logging as _log_mod
+        _log = _log_mod.getLogger(__name__)
+        attempts = 0
+        bs = self.current
+        while True:
+            attempts += 1
+            try:
+                result = fn(bs)
+                if self._fixed is None and bs == self.current:
+                    self._consecutive_ok += 1
+                    if self._consecutive_ok >= 3 and bs < self.max_cap:
+                        new_bs = min(self.max_cap, bs * 2)
+                        if new_bs != bs:
+                            _log.info("batch_size tuner: bumping %d -> %d", bs, new_bs)
+                            self.current = new_bs
+                            self._consecutive_ok = 0
+                return result, bs
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                self._consecutive_ok = 0
+                if bs <= 1:
+                    raise
+                new_bs = max(1, bs // 2)
+                _log.warning("batch_size tuner: OOM at bs=%d -> retry at %d", bs, new_bs)
+                bs = new_bs
+                self.current = bs
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    torch.cuda.empty_cache()
+                    self._consecutive_ok = 0
+                    if bs <= 1:
+                        raise
+                    new_bs = max(1, bs // 2)
+                    _log.warning("batch_size tuner: OOM-like at bs=%d -> retry at %d", bs, new_bs)
+                    bs = new_bs
+                    self.current = bs
+                else:
+                    raise
+            if attempts > 8:
+                raise RuntimeError(f"batch_size tuner: too many attempts (bs={bs})")
+
+
+
 def _parse_whisper_ts(text: str) -> list[tuple[float, float, str]]:
     pieces = TS_PAT.split(text)
     times: list[float] = []
@@ -159,7 +247,11 @@ class EchoPyTorchBackend:
         t0 = time.time()
         # batch_size=1 prevents OOM on long audio (30min+) by processing
         # one chunk at a time instead of batching 32 chunks simultaneously.
-        out = self._pipe(str(audio_path), return_timestamps=True, batch_size=1)
+        out, used_bs = self._batch_tuner.run(
+
+            lambda bs: self._pipe(str(audio_path), return_timestamps=True, batch_size=bs),
+
+        )
         torch.cuda.synchronize()
         elapsed = time.time() - t0
         per_spk = out.get("per_spk_outputs", []) or []
@@ -190,6 +282,7 @@ class EchoPyTorchBackend:
                 "n_speakers": len(speakers),
                 "inference_seconds": round(elapsed, 3),
                 "backend": "pytorch",
+                "batch_size": used_bs,
             },
         }
 
