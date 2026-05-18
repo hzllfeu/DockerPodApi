@@ -1,8 +1,11 @@
-"""Echo Dia + SE-DiCoW PyTorch backend.
+"""Echo Light backend: DiariZen V4 (Echo Dia weights) + DiCoW_v3_3 ASR.
 
-Wraps the existing Hellfeu/echo recipe (DiariZen-based segmentation + SE-DiCoW
-Whisper-style ASR with target-speaker self-enrollment) into a uniform infer()
-that takes a WAV path and returns a normalised result dict.
+Best speed/quality tradeoff for meetings. No self-enrollment (unlike echo-l4).
+
+Architecture:
+  - Diarization: Echo Dia weights (Hellfeu/echo-dia) loaded into DiariZen V2 base
+    (BUT-FIT/diarizen-wavlm-large-s80-md-v2)
+  - ASR: BUT-FIT/DiCoW_v3_3 (vanilla, no SE-DiCoW)
 """
 from __future__ import annotations
 
@@ -20,7 +23,6 @@ import torch
 log = logging.getLogger(__name__)
 
 
-# Whisper-style timestamp tokens: <|12.34|>
 TS_PAT = re.compile(r"<\|(\d+\.\d+)\|>")
 
 
@@ -45,9 +47,6 @@ def _parse_whisper_ts(text: str) -> list[tuple[float, float, str]]:
 
 
 def _patch_torch_load_weights_only() -> None:
-    """Force weights_only=False; pyannote / DiariZen checkpoints contain
-    Python objects that the new safe-load rejects. Our checkpoints come from
-    trusted sources, baked into the image at build time."""
     _orig = torch.load
     def _patched(*a, **kw):  # type: ignore[no-untyped-def]
         kw["weights_only"] = False
@@ -56,7 +55,7 @@ def _patch_torch_load_weights_only() -> None:
 
 
 class EchoPyTorchBackend:
-    """Heavy PyTorch backend. Loaded once at boot."""
+    """Echo Light: DiariZen V4 + DiCoW_v3_3. No self-enrollment."""
 
     def __init__(self):
         self._pipe = None
@@ -68,23 +67,17 @@ class EchoPyTorchBackend:
         t0 = time.time()
         _patch_torch_load_weights_only()
 
-        # Sys.path: DiCoW is vendored alongside the image; DiariZen is pip-installed
         dicow_root = os.environ.get("ECHO_DICOW_ROOT", "/opt/DiCoW")
         sys.path.insert(0, dicow_root)
 
-        log.info("loading Hellfeu/echo-dia weights from local cache...")
+        log.info("loading Echo Dia (V4) weights from local cache...")
         from huggingface_hub import hf_hub_download
-        # Models are baked into the image at build time. At runtime the image
-        # runs with HF_HUB_OFFLINE=1 and local_files_only=True; for local dev
-        # on a pod that already has HF_TOKEN, ECHO_HF_OFFLINE=0 enables online
-        # fallback.
         offline = os.environ.get("ECHO_HF_OFFLINE", "1") == "1"
         weights_path = hf_hub_download(
             repo_id="Hellfeu/echo-dia",
             filename="pytorch_model.bin",
             local_files_only=offline,
         )
-        log.info("  echo-dia weights at %s", weights_path)
 
         log.info("loading DiariZen base pipeline...")
         from diarizen.pipelines.inference import DiariZenPipeline
@@ -94,40 +87,22 @@ class EchoPyTorchBackend:
         sd = torch.load(weights_path, map_location="cuda:0")
         pipe_dia._segmentation.model.load_state_dict(sd, strict=False)
 
-        log.info("loading SE-DiCoW ASR...")
+        log.info("loading DiCoW_v3_3 ASR...")
         from transformers import (
             AutoTokenizer,
             AutoFeatureExtractor,
             AutoModelForSpeechSeq2Seq,
         )
         model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            "BUT-FIT/SE-DiCoW", trust_remote_code=True,
+            "BUT-FIT/DiCoW_v3_3", trust_remote_code=True,
         ).to("cuda")
-
-        # SE-DiCoW remote code has a bug: it does an unconditional
-        # `del self.enrollments` in _retrieve_init_tokens. After the first
-        # call the attribute is gone and the second call raises. We patch
-        # the bound method to be defensive.
-        if hasattr(model, "_retrieve_init_tokens"):
-            _orig = model._retrieve_init_tokens
-            def _safe_retrieve(*args, **kwargs):
-                try:
-                    return _orig(*args, **kwargs)
-                except AttributeError as e:
-                    if "enrollments" in str(e):
-                        # ensure attribute exists before the del, retry
-                        model.enrollments = getattr(model, "enrollments", None)
-                        return _orig(*args, **kwargs)
-                    raise
-            model._retrieve_init_tokens = _safe_retrieve
-        fe = AutoFeatureExtractor.from_pretrained("BUT-FIT/SE-DiCoW")
-        tok = AutoTokenizer.from_pretrained("BUT-FIT/SE-DiCoW")
+        fe = AutoFeatureExtractor.from_pretrained("BUT-FIT/DiCoW_v3_3")
+        tok = AutoTokenizer.from_pretrained("BUT-FIT/DiCoW_v3_3")
         model.config.model_type = "whisper"
         model.tokenizer = tok
         if hasattr(model, "set_tokenizer"):
             model.set_tokenizer(tok)
 
-        # Import DiCoWPipeline from the vendored repo
         spec = importlib.util.spec_from_file_location(
             "dicow_pipeline_mod", os.path.join(dicow_root, "pipeline.py"),
         )
@@ -146,19 +121,16 @@ class EchoPyTorchBackend:
         )
         self._loaded = True
         log.info(
-            "Echo PyTorch pipeline ready in %.1fs, VRAM=%.2f GB",
+            "Echo Light pipeline ready in %.1fs, VRAM=%.2f GB",
             time.time() - t0, torch.cuda.memory_allocated() / 1e9,
         )
 
     def infer(self, audio_path: Path) -> dict[str, Any]:
-        """Run end-to-end pipeline. Returns the normalised result schema."""
         if not self._loaded or self._pipe is None:
             raise RuntimeError("backend not loaded")
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         t0 = time.time()
-        # batch_size=1 prevents OOM on long audio (30min+) by processing
-        # one chunk at a time instead of batching 32 chunks simultaneously.
         out = self._pipe(str(audio_path), return_timestamps=True, batch_size=1)
         torch.cuda.synchronize()
         elapsed = time.time() - t0
@@ -189,20 +161,13 @@ class EchoPyTorchBackend:
             "meta": {
                 "n_speakers": len(speakers),
                 "inference_seconds": round(elapsed, 3),
-                "backend": "pytorch",
+                "backend": "echo-light",
             },
         }
-
-    # ---------- streaming variant ----------
 
     def infer_streaming(
         self, audio_path: Path,
     ) -> Iterator[dict[str, Any]]:
-        """Stream segments as they are produced. Today's DiCoWPipeline runs
-        non-streaming; we emit a synchronous batch then yield segments
-        ordered by time. This is sufficient for the SSE contract (consumer
-        sees one event per segment). A true streaming runtime is left for
-        later (would require restructuring SE-DiCoW)."""
         result = self.infer(audio_path)
         events_by_time: list[tuple[float, dict[str, Any]]] = []
         for sp in result["speakers"]:

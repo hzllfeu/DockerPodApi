@@ -1,0 +1,16 @@
+module(name = "echo_l4", version = "0.1.0")
+
+bazel_dep(name = "rules_oci", version = "2.0.0")
+bazel_dep(name = "rules_pkg", version = "1.0.1")
+
+# CUDA + cuDNN base. Pin the digest after pulling so the build is
+# reproducible. Update with `bazel run @rules_oci//cmd:crane -- digest <ref>`.
+oci = use_extension("@rules_oci//oci:extensions.bzl", "oci")
+oci.pull(
+    name = "cuda_base",
+    image = "docker.io/nvidia/cuda",
+    # 12.1.1-cudnn8-runtime-ubuntu22.04
+    digest = "sha256:810756cab1c28ce693499a5c2ebb66f6d10a61d026998c8606bad449643a4c49",
+    platforms = ["linux/amd64"],
+)
+use_repo(oci, "cuda_base", "cuda_base_linux_amd64")

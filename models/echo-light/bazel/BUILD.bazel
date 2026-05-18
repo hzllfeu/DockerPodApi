@@ -1,0 +1,80 @@
+"""Build the echo-l4 OCI image without a docker daemon.
+
+The image is assembled by stacking tar layers on top of the
+nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04 base:
+
+  1. site-packages: pre-installed Python deps from requirements.txt
+  2. vendored upstream repos: DiariZen + DiCoW (cloned next to /opt)
+  3. model weights: Hellfeu/echo-dia + BUT-FIT/SE-DiCoW + DiariZen
+  4. application code: app/*.py
+
+The tarballs themselves are produced by `scripts/build_layers.sh` (run
+once before `bazel build`) because pre-installing wheels requires a
+Python interpreter we cannot invoke from within Bazel's hermetic env.
+"""
+
+load("@rules_oci//oci:defs.bzl", "oci_image", "oci_push")
+load("@rules_pkg//:pkg.bzl", "pkg_tar")
+
+# Layer 1: pre-built site-packages tarball. Produced offline by the
+# bootstrap script in scripts/build_layers.sh.
+filegroup(
+    name = "site_packages_tar",
+    srcs = ["//:site_packages.tar"],
+)
+
+# Layer 2: vendored DiariZen + DiCoW.
+filegroup(
+    name = "vendored_tar",
+    srcs = ["//:vendored.tar"],
+)
+
+# Layer 3: HF model weights.
+filegroup(
+    name = "models_tar",
+    srcs = ["//:models.tar"],
+)
+
+# Layer 4: app/ code.
+pkg_tar(
+    name = "app_tar",
+    srcs = glob(["../app/**/*.py"]),
+    package_dir = "/opt/app",
+    strip_prefix = "../app",
+)
+
+oci_image(
+    name = "image",
+    base = "@cuda_base",
+    tars = [
+        ":site_packages_tar",
+        ":vendored_tar",
+        ":models_tar",
+        ":app_tar",
+    ],
+    env = {
+        "PYTHONPATH":      "/opt/python-runtime/site-packages:/opt:/opt/DiCoW",
+        "HF_HOME":         "/opt/hf_cache",
+        "HF_HUB_OFFLINE":  "1",
+        "ECHO_DICOW_ROOT": "/opt/DiCoW",
+        "PYTHONUNBUFFERED": "1",
+    },
+    entrypoint = [
+        "python3",
+        "-m",
+        "uvicorn",
+        "app.server:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+    ],
+    exposed_ports = ["8000/tcp"],
+)
+
+oci_push(
+    name = "push",
+    image = ":image",
+    repository = "docker.io/lexiapro/echo-light",
+    remote_tags = ["latest"],
+)
